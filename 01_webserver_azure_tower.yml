@@ -1,6 +1,6 @@
 ---
 - name: Configure Webserver
-  hosts: tag_solution_webserver_YOUR_USER
+  hosts: tag_solution_webserver_work5
   become: true
 
   tasks:
