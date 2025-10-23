@@ -1,0 +1,12 @@
+---
+all:
+  children:
+    windows:
+      hosts:
+        server5:
+      vars:
+        ansible_connection: ssh
+        ansible_shell_type: powershell
+        ansible_user: work5
+        ansible_password: HJKLasdf!ery@2J
+        ansible_ssh_private_key_file: ~/.ssh/windows_rsa

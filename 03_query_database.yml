@@ -1,0 +1,55 @@
+---
+- name: Query SQL Server Database
+  hosts: windows
+  gather_facts: true
+  vars:
+    sql_user: sa
+    sql_password: "P@ssw0rd123!"
+  tasks:
+    - name: Get Windows host IP address
+      ansible.builtin.set_fact:
+        sql_host: "{{ hostvars[inventory_hostname]['ansible_host'] | default(inventory_hostname) }}"
+    - name: Get SQL Server version
+      community.general.mssql_script:
+        login_host: "{{ sql_host }}"
+        login_user: "{{ sql_user }}"
+        login_password: "{{ sql_password }}"
+        login_port: 1433
+        script: "SELECT @@VERSION AS Version"
+      register: sql_version
+      delegate_to: localhost
+    - name: Display SQL Server version
+      ansible.builtin.debug:
+        msg: "{{ sql_version.query_results[0][0][0] }}"
+    - name: List all databases
+      community.general.mssql_script:
+        login_host: "{{ sql_host }}"
+        login_user: "{{ sql_user }}"
+        login_password: "{{ sql_password }}"
+        login_port: 1433
+        script: "SELECT name, create_date FROM sys.databases ORDER BY name"
+      register: databases
+      delegate_to: localhost
+    - name: Display databases
+      ansible.builtin.debug:
+        msg: "{{ item[0] }} - Created: {{ item[1] }}"
+      loop: "{{ databases.query_results[0] }}"
+    - name: Get list of database names
+      community.general.mssql_script:
+        login_host: "{{ sql_host }}"
+        login_user: "{{ sql_user }}"
+        login_password: "{{ sql_password }}"
+        login_port: 1433
+        script: "SELECT name FROM sys.databases WHERE database_id > 4 ORDER BY name"
+      register: user_databases
+      delegate_to: localhost
+    - name: Check SQL Server services
+      ansible.windows.win_service_info:
+        name: "MSSQL$SQLEXPRESS"
+      register: sql_service_info
+    - name: Display service status
+      ansible.builtin.debug:
+        msg:
+          - "Service: {{ sql_service_info.services[0].display_name }}"
+          - "Status: {{ sql_service_info.services[0].state }}"
+          - "Start mode: {{ sql_service_info.services[0].start_mode }}"

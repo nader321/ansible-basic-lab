@@ -1,0 +1,226 @@
+---
+- name: Install SQL Server Express
+  hosts: windows
+  gather_facts: true
+  become: true
+  become_method: runas
+  become_user: SYSTEM
+
+  vars:
+    sql_instance_name: SQLEXPRESS
+    sql_sa_password: "P@ssw0rd123!"
+
+  tasks:
+    - name: Check if SQL Server is already installed
+      ansible.windows.win_service_info:
+        name: "MSSQL${{ sql_instance_name }}"
+      register: sql_service
+
+    - name: Set SQL Server installed fact
+      ansible.builtin.set_fact:
+        sql_installed: "{{ sql_service.services | length > 0 }}"
+
+    - name: Display SQL Server status
+      ansible.builtin.debug:
+        msg: "SQL Server is {{ 'already installed' if sql_installed else 'not installed' }}"
+
+    - name: Install Chocolatey
+      ansible.windows.win_shell: |
+        Set-ExecutionPolicy Bypass -Scope Process -Force
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+        iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+      register: choco_install
+      failed_when: false
+      changed_when: "'Chocolatey is already installed' not in choco_install.stdout"
+
+    - name: Install SQL Server Express using Chocolatey
+      chocolatey.chocolatey.win_chocolatey:
+        name: sql-server-express
+        state: present
+        package_params: >-
+          /INSTANCENAME={{ sql_instance_name }}
+          /SAPWD={{ sql_sa_password }}
+          /SECURITYMODE=SQL
+          /TCPENABLED=1
+          /SQLSYSADMINACCOUNTS={{ ansible_user }}
+      when: not sql_installed
+      register: sql_install
+
+    - name: Wait for SQL Server service to exist
+      ansible.windows.win_service_info:
+        name: "MSSQL${{ sql_instance_name }}"
+      retries: 60
+      delay: 10
+      register: sql_service_wait
+      until: sql_service_wait.services | length > 0
+      when: sql_install.changed
+
+    - name: Start SQL Server service if not running
+      ansible.windows.win_service:
+        name: "MSSQL${{ sql_instance_name }}"
+        state: started
+      retries: 5
+      delay: 10
+      register: start_result
+      until: start_result is succeeded
+      when: sql_install.changed
+
+    - name: Enable SQL Server Browser service
+      ansible.windows.win_service:
+        name: SQLBrowser
+        start_mode: auto
+        state: started
+
+    - name: Configure firewall for SQL Server
+      ansible.windows.win_shell: |
+        New-NetFirewallRule -DisplayName "SQL Server" -Direction Inbound `
+          -Protocol TCP -LocalPort 1433 -Action Allow -Enabled True
+      register: firewall_sql
+      failed_when:
+        - firewall_sql.rc != 0
+        - "'already exists' not in firewall_sql.stderr"
+      changed_when: "'already exists' not in firewall_sql.stderr"
+
+    - name: Configure firewall for SQL Browser
+      ansible.windows.win_shell: |
+        New-NetFirewallRule -DisplayName "SQL Browser" -Direction Inbound `
+          -Protocol UDP -LocalPort 1434 -Action Allow -Enabled True
+      register: firewall_browser
+      failed_when:
+        - firewall_browser.rc != 0
+        - "'already exists' not in firewall_browser.stderr"
+      changed_when: "'already exists' not in firewall_browser.stderr"
+
+    - name: Get SQL Server instance registry path
+      ansible.windows.win_shell: |
+        $instancePath = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL" -Name {{ sql_instance_name }} -ErrorAction SilentlyContinue
+        if ($instancePath) {
+          Write-Output $instancePath.{{ sql_instance_name }}
+        }
+      register: sql_instance_path
+      changed_when: false
+
+    - name: Configure TCP/IP protocol and port 1433
+      ansible.windows.win_shell: |
+        $instanceName = "{{ sql_instance_path.stdout | trim }}"
+        if ([string]::IsNullOrEmpty($instanceName)) {
+          Write-Error "Could not find SQL Server instance registry path"
+          exit 1
+        }
+
+        $regPath = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$instanceName\MSSQLServer\SuperSocketNetLib\Tcp"
+
+        # Enable TCP/IP protocol
+        Set-ItemProperty -Path $regPath -Name Enabled -Value 1
+
+        # Configure IPAll to use static port 1433
+        $ipAllPath = "$regPath\IPAll"
+        Set-ItemProperty -Path $ipAllPath -Name TcpPort -Value "1433"
+        Set-ItemProperty -Path $ipAllPath -Name TcpDynamicPorts -Value ""
+
+        Write-Output "TCP/IP protocol enabled on static port 1433"
+      register: enable_tcp
+      changed_when: true
+
+    - name: Enable Mixed Mode Authentication in registry
+      ansible.windows.win_shell: |
+        $instanceName = "{{ sql_instance_path.stdout | trim }}"
+        if ([string]::IsNullOrEmpty($instanceName)) {
+          Write-Error "Could not find SQL Server instance registry path"
+          exit 1
+        }
+
+        $regPath = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$instanceName\MSSQLServer"
+
+        # Get current LoginMode
+        $currentMode = Get-ItemProperty -Path $regPath -Name LoginMode -ErrorAction SilentlyContinue
+
+        if ($currentMode.LoginMode -eq 2) {
+          Write-Output "Mixed Mode already enabled (LoginMode = 2)"
+          exit 0
+        } else {
+          # Set LoginMode to 2 (Mixed Mode: SQL + Windows Authentication)
+          Set-ItemProperty -Path $regPath -Name LoginMode -Value 2
+          Write-Output "Mixed Mode Authentication enabled (LoginMode set to 2)"
+          exit 0
+        }
+      register: enable_mixed_mode
+      changed_when: "'Mixed Mode Authentication enabled' in enable_mixed_mode.stdout"
+
+    - name: Restart SQL Server to apply TCP/IP and authentication changes
+      ansible.windows.win_service:
+        name: "MSSQL${{ sql_instance_name }}"
+        state: restarted
+      when: enable_tcp.changed or enable_mixed_mode.changed
+
+    - name: Wait for SQL Server service to be running
+      ansible.windows.win_service_info:
+        name: "MSSQL${{ sql_instance_name }}"
+      register: service_status
+      until: service_status.services[0].state == 'started'
+      retries: 30
+      delay: 2
+      when: enable_tcp.changed or enable_mixed_mode.changed
+
+    - name: Enable SA login using Windows Authentication
+      ansible.windows.win_shell: |
+        # Wait for SQL Server to be fully ready
+        Start-Sleep -Seconds 5
+
+        # Enable SA login and ensure password is set
+        sqlcmd -S localhost\{{ sql_instance_name }} -E -Q "
+        ALTER LOGIN sa ENABLE;
+        ALTER LOGIN sa WITH PASSWORD = '{{ sql_sa_password }}', CHECK_POLICY = OFF;
+        " -b
+      register: enable_sa
+      when: enable_tcp.changed or enable_mixed_mode.changed
+      failed_when: false
+
+    - name: Wait for SQL Server to be ready with SA login
+      ansible.windows.win_shell: |
+        $maxAttempts = 30
+        $attempt = 0
+        do {
+          $attempt++
+          try {
+            sqlcmd -S localhost\{{ sql_instance_name }} -U sa -P "{{ sql_sa_password }}" -Q "SELECT 1" -b
+            Write-Output "SQL Server is ready with SA authentication"
+            exit 0
+          } catch {
+            Start-Sleep -Seconds 2
+          }
+        } while ($attempt -lt $maxAttempts)
+        Write-Error "SQL Server did not become ready in time"
+        exit 1
+      when: enable_tcp.changed or enable_mixed_mode.changed
+      register: sql_ready
+
+    - name: Enable remote connections in SQL Server
+      ansible.windows.win_shell: |
+        # Enable remote connections
+        sqlcmd -S localhost\{{ sql_instance_name }} -U sa -P "{{ sql_sa_password }}" -Q "EXEC sp_configure 'remote access', 1; RECONFIGURE;"
+        Write-Output "Remote connections enabled"
+      register: enable_remote
+      ignore_errors: true
+
+    - name: Verify SQL Server is listening on port 1433
+      ansible.windows.win_shell: |
+        $listener = Get-NetTCPConnection -LocalPort 1433 -State Listen -ErrorAction SilentlyContinue
+        if ($listener) {
+          Write-Output "SQL Server is listening on port 1433"
+          Write-Output "Process: $(Get-Process -Id $listener.OwningProcess | Select-Object -ExpandProperty Name)"
+        } else {
+          Write-Warning "Port 1433 is not in listening state yet. SQL Server may need more time to start."
+        }
+      register: port_check
+      changed_when: false
+
+    - name: Display installation complete message
+      ansible.builtin.debug:
+        msg:
+          - "SQL Server Express installation complete"
+          - "Instance name: {{ sql_instance_name }}"
+          - "SA password: {{ sql_sa_password }}"
+          - "TCP/IP enabled on static port 1433"
+          - "Port status: {{ port_check.stdout_lines[0] | default('Check manually with: netstat -an | findstr 1433') }}"
+          - "Connection string: Server={{ ansible_hostname }}\\{{ sql_instance_name }};Database=master;User Id=sa;Password={{ sql_sa_password }};"

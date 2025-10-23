@@ -1,0 +1,17 @@
+namespace: local
+name: webserver
+version: 1.0.0
+readme: README.md
+authors:
+  - Your Name <your.email@example.com>
+description: A collection for web server automation
+license:
+  - GPL-3.0-or-later
+tags:
+  - web
+  - nginx
+  - apache
+repository: https://github.com/yourusername/ansible-webserver
+documentation: https://github.com/yourusername/ansible-webserver/blob/main/README.md
+homepage: https://github.com/yourusername/ansible-webserver
+issues: https://github.com/yourusername/ansible-webserver/issues
