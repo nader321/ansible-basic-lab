@@ -1,0 +1,55 @@
+---
+- name: Manage virtual machine state
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    ovirt_engine_url: "https://ovirt.internal.cloudapp.net/ovirt-engine/api"
+    ovirt_engine_user: "admin@ovirt@internalsso"
+    ovirt_engine_password: "ChangeMe123!"
+    vm_name: "ubuntu-vm"
+    vm_state: "running"  # Options: running, stopped, suspended
+
+  tasks:
+    - name: Authenticate to oVirt
+      ovirt.ovirt.ovirt_auth:
+        url: "{{ ovirt_engine_url }}"
+        username: "{{ ovirt_engine_user }}"
+        password: "{{ ovirt_engine_password }}"
+        insecure: true
+      register: ovirt_auth
+      no_log: true
+
+    - name: Detach CD
+      ovirt.ovirt.ovirt_vm:
+        auth: "{{ ovirt_auth.ansible_facts.ovirt_auth }}"
+        name: "{{ vm_name }}"
+        cd_iso: ""
+      when: not vm_state == "running" 
+
+    - name: Set VM state to {{ vm_state }}
+      ovirt.ovirt.ovirt_vm:
+        auth: "{{ ovirt_auth.ansible_facts.ovirt_auth }}"
+        name: "{{ vm_name }}"
+        state: "{{ vm_state }}"
+        wait: true
+      register: vm_state_result
+
+    - name: Get VM information
+      ovirt.ovirt.ovirt_vm_info:
+        auth: "{{ ovirt_auth.ansible_facts.ovirt_auth }}"
+        pattern: "name={{ vm_name }}"
+      register: vm_info
+
+    - name: Display VM status
+      ansible.builtin.debug:
+        msg:
+          - "VM: {{ vm_name }}"
+          - "Status: {{ vm_info.ovirt_vms[0].status }}"
+          - "IP Address: {{ vm_info.ovirt_vms[0].reported_devices[0].ips[0].address | default('No IP assigned yet') }}"
+      when: vm_info.ovirt_vms | length > 0
+
+    - name: Revoke authentication
+      ovirt.ovirt.ovirt_auth:
+        state: absent
+        ovirt_auth: "{{ ovirt_auth.ansible_facts.ovirt_auth }}"

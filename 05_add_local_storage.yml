@@ -1,0 +1,70 @@
+---
+- name: Configure local storage domain
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    ovirt_engine_url: "https://ovirt.internal.cloudapp.net/ovirt-engine/api"
+    ovirt_engine_user: "admin@ovirt@internalsso"
+    ovirt_engine_password: "ChangeMe123!"
+    datacenter_name: "Default"
+    cluster_name: "Default"
+    host_name: "host1"
+
+    # Local storage settings
+    local_storage_path: "/data/ovirt-storage"
+    storage_domain_name: "local-storage"
+
+  tasks:
+    - name: Authenticate to oVirt
+      ovirt.ovirt.ovirt_auth:
+        url: "{{ ovirt_engine_url }}"
+        username: "{{ ovirt_engine_user }}"
+        password: "{{ ovirt_engine_password }}"
+        insecure: true
+      register: ovirt_auth
+      no_log: true
+
+    - name: Add local storage domain
+      ovirt.ovirt.ovirt_storage_domain:
+        auth: "{{ ovirt_auth.ansible_facts.ovirt_auth }}"
+        name: "{{ storage_domain_name }}"
+        description: "Local storage domain"
+        data_center: "Default"
+        host: "{{ host_name }}"
+        localfs:
+          path: "{{ local_storage_path }}"
+        state: present
+      register: storage_result
+
+    - name: Wait for storage domain to become active
+      ovirt.ovirt.ovirt_storage_domain_info:
+        auth: "{{ ovirt_auth.ansible_facts.ovirt_auth }}"
+        pattern: "name={{ storage_domain_name }}"
+      register: storage_info
+      until: >
+        storage_info.ovirt_storage_domains | length > 0 and
+        storage_info.ovirt_storage_domains[0].external_status == 'ok'
+      retries: 30
+      delay: 10
+      when: storage_result.changed
+
+    - name: Get storage domain info if not waiting
+      ovirt.ovirt.ovirt_storage_domain_info:
+        auth: "{{ ovirt_auth.ansible_facts.ovirt_auth }}"
+        pattern: "name={{ storage_domain_name }}"
+      register: storage_info
+      when: not storage_result.changed
+
+    - name: Display storage configuration
+      ansible.builtin.debug:
+        msg:
+          - "Local storage domain configured"
+          - "Path: {{ local_storage_path }}"
+          - "Status: {{ storage_info.ovirt_storage_domains[0].status | default('unknown') }}"
+      when: storage_info.ovirt_storage_domains | length > 0
+
+    - name: Revoke authentication token
+      ovirt.ovirt.ovirt_auth:
+        state: absent
+        ovirt_auth: "{{ ovirt_auth.ansible_facts.ovirt_auth }}"

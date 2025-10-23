@@ -1,0 +1,177 @@
+---
+- name: Prepare local disk for oVirt storage
+  hosts: ovirthosts
+  become: true
+  gather_facts: true
+
+  vars:
+    storage_disk: "/dev/sdb"
+    storage_mount_path: "/data/ovirt-storage"
+    storage_filesystem: "xfs"
+
+  tasks:
+    - name: Check if disk exists
+      ansible.builtin.stat:
+        path: "{{ storage_disk }}"
+      register: disk_check
+
+    - name: Fail if disk does not exist
+      ansible.builtin.fail:
+        msg: "Disk {{ storage_disk }} does not exist on {{ inventory_hostname }}"
+      when: not disk_check.stat.exists
+
+    - name: Display all multipath devices
+      ansible.builtin.command:
+        cmd: multipath -ll
+      register: multipath_list
+      changed_when: false
+      failed_when: false
+
+    - name: Show multipath information
+      ansible.builtin.debug:
+        msg: "{{ multipath_list.stdout_lines }}"
+      when: multipath_list.rc == 0
+
+    - name: Get multipath device for disk
+      ansible.builtin.shell:
+        cmd: |
+          # Get the device name (e.g., sdb)
+          DISK=$(basename {{ storage_disk }})
+          # Find the multipath device that uses this disk
+          multipath -ll | grep -B 3 "$DISK" | head -1 | awk '{print $1}'
+      register: mpath_device
+      changed_when: false
+      failed_when: false
+
+    - name: Set device to use (multipath if available, otherwise raw disk)
+      ansible.builtin.set_fact:
+        device_to_use: "{{ '/dev/mapper/' + mpath_device.stdout if mpath_device.stdout != '' else storage_disk }}"
+
+    - name: Display device selection
+      ansible.builtin.debug:
+        msg:
+          - "Raw disk: {{ storage_disk }}"
+          - "Multipath device: {{ mpath_device.stdout if mpath_device.stdout != '' else 'Not found' }}"
+          - "Using device: {{ device_to_use }}"
+
+    - name: Display disk information
+      ansible.builtin.command:
+        cmd: lsblk {{ device_to_use }}
+      register: disk_info
+      changed_when: false
+
+    - name: Show disk details
+      ansible.builtin.debug:
+        var: disk_info.stdout_lines
+
+    - name: Check if filesystem already exists on device
+      ansible.builtin.command:
+        cmd: blkid -o value -s TYPE {{ device_to_use }}
+      register: blkid_check
+      changed_when: false
+      failed_when: false
+
+    - name: Display existing filesystem info
+      ansible.builtin.debug:
+        msg: "Existing filesystem type: {{ blkid_check.stdout }}"
+      when: blkid_check.rc == 0 and blkid_check.stdout != ""
+
+    - name: Create XFS filesystem directly on multipath device
+      community.general.filesystem:
+        fstype: "{{ storage_filesystem }}"
+        dev: "{{ device_to_use }}"
+        force: false  # Set to true to recreate filesystem
+      register: fs_result
+      when: blkid_check.rc != 0 or blkid_check.stdout == ""
+
+    - name: Display filesystem creation result
+      ansible.builtin.debug:
+        msg: "Filesystem already exists ({{ blkid_check.stdout }}), skipping creation"
+      when: blkid_check.rc == 0 and blkid_check.stdout != ""
+
+    - name: Wait for filesystem to be recognized
+      ansible.builtin.pause:
+        seconds: 2
+      when: fs_result.changed | default(false)
+
+    - name: Get UUID of the filesystem
+      ansible.builtin.command:
+        cmd: blkid -s UUID -o value {{ device_to_use }}
+      register: fs_uuid
+      changed_when: false
+      retries: 3
+      delay: 2
+      until: fs_uuid.rc == 0
+
+    - name: Get filesystem label
+      ansible.builtin.command:
+        cmd: blkid -s LABEL -o value {{ device_to_use }}
+      register: fs_label
+      changed_when: false
+      failed_when: false
+
+    - name: Create mount point directory
+      ansible.builtin.file:
+        path: "{{ storage_mount_path }}"
+        state: directory
+        mode: '0755'
+
+    - name: Display filesystem details
+      ansible.builtin.debug:
+        msg:
+          - "Filesystem UUID: {{ fs_uuid.stdout }}"
+          - "Filesystem Label: {{ fs_label.stdout if fs_label.stdout != '' else 'None' }}"
+          - "Filesystem Type: {{ storage_filesystem }}"
+
+    - name: Mount the filesystem using UUID
+      ansible.posix.mount:
+        path: "{{ storage_mount_path }}"
+        src: "UUID={{ fs_uuid.stdout }}"
+        fstype: "{{ storage_filesystem }}"
+        opts: defaults,noatime,_netdev
+        state: mounted
+
+    - name: Set ownership for oVirt (vdsm user)
+      ansible.builtin.file:
+        path: "{{ storage_mount_path }}"
+        owner: vdsm
+        group: kvm
+        mode: '0755'
+      register: ownership_result
+      ignore_errors: true
+
+    - name: Set temporary ownership if vdsm user doesn't exist yet
+      ansible.builtin.file:
+        path: "{{ storage_mount_path }}"
+        owner: root
+        group: root
+        mode: '0755'
+      when: ownership_result.failed | default(false)
+
+    - name: Display filesystem information
+      ansible.builtin.command:
+        cmd: df -h {{ storage_mount_path }}
+      register: df_output
+      changed_when: false
+
+    - name: Display mount information
+      ansible.builtin.command:
+        cmd: findmnt {{ storage_mount_path }}
+      register: findmnt_output
+      changed_when: false
+
+    - name: Show storage details
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "Storage disk prepared successfully!"
+          - "=========================================="
+          - "{{ df_output.stdout_lines }}"
+          - ""
+          - "{{ findmnt_output.stdout_lines }}"
+          - ""
+          - "Mount point: {{ storage_mount_path }}"
+          - "Filesystem: {{ storage_filesystem }}"
+          - "Device: {{ device_to_use }}"
+          - "UUID: {{ fs_uuid.stdout }}"
+          - "=========================================="

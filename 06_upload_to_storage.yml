@@ -1,0 +1,46 @@
+---
+- name: Upload Ubuntu Server to Local Storage
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    ovirt_engine_url: "https://ovirt.internal.cloudapp.net/ovirt-engine/api"
+    ovirt_engine_user: "admin@ovirt@internalsso"
+    ovirt_engine_password: "ChangeMe123!"
+    datacenter_name: "Default"
+    cluster_name: "Default"
+    host_name: "host1"
+    storage_domain_name: "local-storage"
+    download_url: "https://releases.ubuntu.com/24.04.3/ubuntu-24.04.3-live-server-amd64.iso"
+    iso_path: "{{ lookup('env', 'HOME') }}/ubuntu-24.04.3-live-server-amd64.iso"
+
+  tasks:
+    - name: Download Ubuntu Server
+      ansible.builtin.get_url:
+        url: "{{ download_url }}"
+        dest: "{{ iso_path }}"
+
+    - name: Authenticate to oVirt
+      ovirt.ovirt.ovirt_auth:
+        url: "{{ ovirt_engine_url }}"
+        username: "{{ ovirt_engine_user }}"
+        password: "{{ ovirt_engine_password }}"
+        ca_file: "~/ovirt-ca.pem"
+      register: ovirt_auth
+      no_log: true
+
+    - name: Upload ISO file
+      ovirt.ovirt.ovirt_disk:
+        auth: "{{ ovirt_auth.ansible_facts.ovirt_auth }}"
+        name: "ubuntu-24.04.3-server"
+        upload_image_path: "{{ iso_path }}"
+        storage_domain: "{{ storage_domain_name }}"
+        format: raw
+        content_type: iso
+        wait: true
+      register: iso_result
+
+    - name: Revoke the SSO token
+      ovirt_auth:
+        state: absent
+        ovirt_auth: "{{ ovirt_auth.ansible_facts.ovirt_auth }}"

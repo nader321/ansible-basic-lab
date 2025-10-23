@@ -1,0 +1,143 @@
+---
+- name: Create virtual machine in oVirt with Ubuntu ISO
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # oVirt Engine Connection Details
+    ovirt_engine_url: "https://ovirt.internal.cloudapp.net/ovirt-engine/api"
+    ovirt_engine_user: "admin@ovirt@internalsso"
+    ovirt_engine_password: "ChangeMe123!"
+    
+    # oVirt Environment
+    datacenter_name: "Default"
+    cluster_name: "Default"
+    storage_domain_name: "local-storage"
+    
+    # VM specifications
+    vm_name: "ubuntu-vm"
+    vm_memory: "4GiB"  # Ubuntu Server works better with more memory
+    vm_cpu_cores: 2
+    vm_cpu_sockets: 1
+    vm_disk_size: "20GiB"
+    vm_os_type: "ubuntu_24_04_x64"  # OS type for Ubuntu 24.04
+    vm_network: "ovirtmgmt"
+    
+    # ISO file settings
+    iso_name: "ubuntu-24.04.3-server"  # Name of the ISO in oVirt
+    
+    # Network configuration
+    vm_ip_address: "10.1.0.100"    # Change to your desired static IP
+    vm_netmask: "255.255.255.0"         # Change to your network mask
+    vm_gateway: "10.1.0.1"         # Change to your network gateway
+    vm_dns_servers: "168.63.129.16"   # DNS servers
+  tasks:
+    - name: Authenticate to oVirt
+      ovirt.ovirt.ovirt_auth:
+        url: "{{ ovirt_engine_url }}"
+        username: "{{ ovirt_engine_user }}"
+        password: "{{ ovirt_engine_password }}"
+        ca_file: "~/ovirt-ca.pem"
+      register: ovirt_auth
+      no_log: true
+      
+    - name: Create virtual machine
+      ovirt.ovirt.ovirt_vm:
+        auth: "{{ ovirt_auth.ansible_facts.ovirt_auth }}"
+        name: "{{ vm_name }}"
+        cluster: "{{ cluster_name }}"
+        memory: "{{ vm_memory }}"
+        cpu_cores: "{{ vm_cpu_cores }}"
+        cpu_sockets: "{{ vm_cpu_sockets }}"
+        type: server
+        operating_system: "{{ vm_os_type }}"
+        boot_devices:
+          - cdrom  # Make sure to boot from CD-ROM first
+          - hd
+        cloud_init:
+          host_name: "{{ vm_name }}"
+          user_name: ubuntu
+          root_password: "StrongP@ssw0rd"  # Change to your desired password
+          authorized_ssh_keys: "{{ lookup('file', '~/.ssh/id_ed25519.pub') | default('', true) }}"  # Optional: your SSH public key
+          custom_script: |
+            #cloud-config
+            write_files:
+              - path: /etc/netplan/50-cloud-init.yaml
+                content: |
+                  network:
+                    version: 2
+                    ethernets:
+                      enp1s0:  # Primary network interface, might be different in your VM
+                        dhcp4: no
+                        addresses: [{{ vm_ip_address }}/24]
+                        routes:
+                          - to: default
+                            via: {{ vm_gateway }}
+                        nameservers:
+                          addresses: [{{ vm_dns_servers | replace(',', ', ') }}]
+            runcmd:
+              - netplan apply
+              - apt-get update
+              - apt-get upgrade -y
+            packages:
+              - qemu-guest-agent
+              - openssh-server
+              - vim
+        state: present
+      register: vm_created
+      
+    - name: Create VM disk
+      ovirt.ovirt.ovirt_disk:
+        auth: "{{ ovirt_auth.ansible_facts.ovirt_auth }}"
+        name: "{{ vm_name }}_disk1"
+        description: "System disk for {{ vm_name }}"
+        vm_name: "{{ vm_name }}"
+        size: "{{ vm_disk_size }}"
+        format: cow
+        interface: virtio_scsi
+        storage_domain: "{{ storage_domain_name }}"
+        bootable: true
+        state: present
+      register: disk_created
+      
+    - name: Attach network to VM
+      ovirt.ovirt.ovirt_nic:
+        auth: "{{ ovirt_auth.ansible_facts.ovirt_auth }}"
+        name: "nic1"
+        vm: "{{ vm_name }}"
+        network: "{{ vm_network }}"
+        interface: virtio
+        state: present
+      register: nic_created
+
+    - name: Attach CD
+      ovirt.ovirt.ovirt_vm:
+        auth: "{{ ovirt_auth.ansible_facts.ovirt_auth }}"
+        name: "{{ vm_name }}"
+        cd_iso: "{{ iso_name }}"
+
+    - name: Start the VM
+      ovirt.ovirt.ovirt_vm:
+        auth: "{{ ovirt_auth.ansible_facts.ovirt_auth }}"
+        name: "{{ vm_name }}"
+        state: running
+      register: vm_started
+      
+    - name: Display VM creation status
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "Virtual Machine Created Successfully!"
+          - "=========================================="
+          - "VM Name: {{ vm_name }}"
+          - "Memory: {{ vm_memory }}"
+          - "CPUs: {{ vm_cpu_cores }} cores, {{ vm_cpu_sockets }} socket(s)"
+          - "Disk: {{ vm_disk_size }}"
+          - "Network: {{ vm_network }}"
+          - "ISO Attached: {{ iso_name }}"
+          - "VM Status: {{ 'Running' if vm_started.changed else 'Created' }}"
+          - "=========================================="
+          
+    - name: Revoke authentication
+      ovirt.ovirt.ovirt_auth:
+        state: absent
+        ovirt_auth: "{{ ovirt_auth.ansible_facts.ovirt_auth }}"
